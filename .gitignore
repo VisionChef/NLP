@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+hf_cache/
+*.mp3
+*.wav
+*.log
+.vscode/
+.env

@@ -13,8 +13,10 @@ import time
 os.environ["HF_HOME"] = os.path.abspath("hf_cache")
 os.environ["HF_HUB_DISABLE_EXPERIMENTAL_XET"] = "1"
 
-# 🔑 허깅페이스 토큰
-HF_TOKEN = "자신의 허깅페이스 토큰 입력"
+# 🔑 허깅페이스 토큰 (환경 변수에서 로드)
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    raise ValueError("Hugging Face 토큰이 설정되지 않았습니다. HF_TOKEN 환경 변수를 설정해주세요.")
 login(token=HF_TOKEN)
 
 app = FastAPI()

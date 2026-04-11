@@ -33,59 +33,51 @@ def run_vision():
         return
         
     print(f"👁️ [Vision] YOLO 모드 시작: {IMAGE_PATH}")
-    last_ingredients = set()
+    
+    frame = cv2.imread(IMAGE_PATH)
+    if frame is None:
+        print("⚠️ [Vision] 이미지를 로드할 수 없습니다.")
+        return
 
-    while True:
-        frame = cv2.imread(IMAGE_PATH)
-        if frame is None:
-            print("⚠️ [Vision] 이미지를 로드할 수 없습니다.")
-            break
+    # 1. Ultralytics YOLO 모델로 객체 탐지
+    try:
+        results = model(frame)
+    except Exception as e:
+        print(f"⚠️ [Vision] 객체 탐지 중 오류 발생: {e}")
+        return
 
-        # 1. Ultralytics YOLO 모델로 객체 탐지
+    current_ingredients = []
+
+    # 2. 결과 처리
+    for box in results[0].boxes:
+        confidence = box.conf[0]
+        if confidence > 0.4:
+            class_id = int(box.cls[0])
+            class_name = model.names[class_id]
+            current_ingredients.append(class_name)
+
+            # 바운딩 박스 좌표 및 시각화
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"{class_name}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    unique_ingredients = list(set(current_ingredients))
+
+    # 3. 서버 전송
+    if unique_ingredients:
+        print(f"📡 [Vision -> LLM] 업데이트 전송: {unique_ingredients}")
         try:
-            results = model(frame)
-        except Exception as e:
-            print(f"⚠️ [Vision] 객체 탐지 중 오류 발생: {e}")
-            time.sleep(3)
-            continue
+            requests.post(LLM_SERVER_URL, json={"ingredients": unique_ingredients}, timeout=3)
+            print("✅ 전송 완료.")
+        except requests.exceptions.RequestException:
+            print("⚠️ [Vision] LLM 서버 연결 불가")
+    else:
+        print("ℹ️ [Vision] 탐지된 재료가 없습니다.")
 
-        current_ingredients = []
-
-        # 2. 결과 처리
-        # results[0]에 탐지 결과가 들어있습니다.
-        for box in results[0].boxes:
-            confidence = box.conf[0]
-            if confidence > 0.4:
-                class_id = int(box.cls[0])
-                class_name = model.names[class_id]
-                current_ingredients.append(class_name)
-
-                # 바운딩 박스 좌표
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
-                # 화면에 바운딩 박스와 클래스 이름 표시
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"{class_name}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        unique_ingredients = list(set(current_ingredients))
-
-        # 3. 서버 전송 (변화가 있을 때만)
-        if set(unique_ingredients) != last_ingredients:
-            print(f"📡 [Vision -> LLM] 업데이트 전송: {unique_ingredients}")
-            try:
-                requests.post(LLM_SERVER_URL, json={"ingredients": unique_ingredients}, timeout=2)
-                last_ingredients = set(unique_ingredients)
-            except requests.exceptions.RequestException:
-                print("⚠️ [Vision] LLM 서버 연결 불가")
-
-        # 화면에 결과 보여주기
-        cv2.imshow("Robot Eye (YOLO Mode)", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        
-        time.sleep(3)
-
+    # 화면에 결과 보여주기
+    cv2.imshow("Robot Eye (YOLO Mode)", frame)
+    print("ℹ️ [Vision] 3초 후 창을 닫습니다...")
+    cv2.waitKey(3000)
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":

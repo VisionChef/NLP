@@ -6,3 +6,4 @@ hf_cache/
 *.log
 .vscode/
 .env
+LLM/Rag/chroma_db/

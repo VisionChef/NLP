@@ -22,9 +22,10 @@ os.environ["HF_HOME"] = os.environ.get("HF_HOME", r"C:\hf_cache_clean")
 # ─────────────────────────────────────
 # 경로 설정
 # ─────────────────────────────────────
+MODULE_DIR = Path(__file__).resolve().parent
 BOOK_RECIPES_FILE     = "recipes.json"
 TRENDING_RECIPES_FILE = "trending_recipes.json"
-CHROMA_DIR            = "./chroma_db"
+CHROMA_DIR            = "chroma_db"
 
 MIN_SIMILARITY_SCORE = 0.85
 
@@ -311,12 +312,12 @@ def format_results(
 # ─────────────────────────────────────
 if __name__ == "__main__":
     # 1. 두 JSON 로드
-    book_docs     = load_recipes(BOOK_RECIPES_FILE,     source_type="Baek_Book")
-    trending_docs = load_recipes(TRENDING_RECIPES_FILE, source_type="trending")
+    book_docs = load_recipes(str(MODULE_DIR / BOOK_RECIPES_FILE), source_type="Baek_Book")
+    trending_docs = load_recipes(str(MODULE_DIR / TRENDING_RECIPES_FILE), source_type="trending")
     all_docs = book_docs + trending_docs
 
     # 2. 벡터 DB 구축
-    vectorstore = build_vectorstore(all_docs, CHROMA_DIR)
+    vectorstore = build_vectorstore(all_docs, str(MODULE_DIR / CHROMA_DIR))
 
     # 3. 재료 입력
     print("\n냉장고에 있는 재료를 입력하세요 (띄어쓰기 또는 쉼표로 구분):")

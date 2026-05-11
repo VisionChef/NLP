@@ -3,22 +3,43 @@ import time
 import requests
 import os
 from datetime import datetime
+from pathlib import Path
 from ultralytics import YOLO
 import mediapipe as mp
 
 # ==========================================
 # ⚙️ 설정
 # ==========================================
-LLM_SERVER_URL = "http://127.0.0.1:8000/vision"
+MODULE_DIR = Path(__file__).resolve().parent
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+LLM_PORT = os.getenv("LLM_PORT", "8000")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", f"http://127.0.0.1:{LLM_PORT}").rstrip("/")
+LLM_SERVER_URL = f"{LLM_BASE_URL}/vision"
 
 # 🧠 YOLO 모델 설정
-YOLO_MODEL_PATH = "best.pt" 
+YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(MODULE_DIR / "best.pt")))
 
 # 📷 카메라 설정 (0: 기본 웹캠)
-CAMERA_INDEX = 0
+CAMERA_INDEX = _env_int("VISION_CAMERA_INDEX", 0)
 
 # ⏱️ 안정화 대기 시간 (초)
-STABLE_DURATION = 3.0  
+STABLE_DURATION = _env_float("VISION_STABLE_DURATION", 3.0)
+CAPTURE_DIR = Path(os.getenv("VISION_CAPTURE_DIR", str(MODULE_DIR / "captures")))
 
 # ------------------------------------------
 # ✋ MediaPipe 손 인식 설정
@@ -59,18 +80,19 @@ def detect_gesture(hand_landmarks):
     return "NONE"
 
 def run_vision():
-    if not os.path.exists(YOLO_MODEL_PATH):
+    if not YOLO_MODEL_PATH.exists():
         print(f"❌ [Vision] '{YOLO_MODEL_PATH}' 파일을 찾을 수 없습니다.")
         return
 
     # YOLO 모델 로드
     try:
-        model = YOLO(YOLO_MODEL_PATH)
+        model = YOLO(str(YOLO_MODEL_PATH))
     except Exception as e:
         print(f"❌ [Vision] YOLO 모델 로드 오류: {e}")
         return
         
     print(f"👁️ [Vision] 실시간 웹캠 객체 및 제스처 탐지 시작")
+    print(f"🔗 [Vision] LLM 서버: {LLM_SERVER_URL}")
     
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -119,9 +141,9 @@ def run_vision():
         
         # ✌️ 브이 (화면 캡처 로직) - 상태에 상관없이 작동
         if current_gesture == "PEACE" and (current_time - capture_cooldown) > 3.0:
-            os.makedirs("captures", exist_ok=True)
-            filename = f"captures/capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            cv2.imwrite(filename, frame)
+            CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+            filename = CAPTURE_DIR / f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(str(filename), frame)
             capture_cooldown = current_time
             feedback_message = f"Captured! ({filename})"
             feedback_time = current_time
@@ -136,7 +158,7 @@ def run_vision():
             current_ingredients = []
             
             for box in results[0].boxes:
-                confidence = box.conf[0]
+                confidence = float(box.conf[0])
                 if confidence > 0.4:
                     class_id = int(box.cls[0])
                     class_name = model.names[class_id]
@@ -165,7 +187,7 @@ def run_vision():
                                     "action": "ask_confirmation",
                                     "ingredients": list(current_stable_ingredients)
                                 }, timeout=3)
-                            except:
+                            except requests.exceptions.RequestException:
                                 print("⚠️ [Vision] LLM 서버 연결 불가")
                             
                             STATE = "WAITING_CONFIRM"
@@ -193,8 +215,8 @@ def run_vision():
                         "action": "confirm",
                         "ingredients": list(current_stable_ingredients)
                     }, timeout=3)
-                except:
-                    pass
+                except requests.exceptions.RequestException:
+                    print("⚠️ [Vision] LLM 서버 연결 불가")
                 last_sent_ingredients = current_stable_ingredients
                 STATE = "DETECTING"
                 current_stable_ingredients = set()
@@ -205,8 +227,8 @@ def run_vision():
                 print("🔄 [Vision] ✊ 사용자 거절! 탐지를 다시 시작합니다.")
                 try:
                     requests.post(LLM_SERVER_URL, json={"action": "reject"}, timeout=3)
-                except:
-                    pass
+                except requests.exceptions.RequestException:
+                    print("⚠️ [Vision] LLM 서버 연결 불가")
                 STATE = "DETECTING"
                 current_stable_ingredients = set()
                 stable_start_time = current_time

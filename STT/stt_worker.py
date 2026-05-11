@@ -1,11 +1,35 @@
 import speech_recognition as sr
+import os
 import requests
 import time
+import webbrowser
+from typing import Optional
 
 # ==========================================
 # ⚙️ 설정
 # ==========================================
-LLM_ASK_URL = "http://127.0.0.1:8000/ask"
+LLM_PORT = os.getenv("LLM_PORT", "8000")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", f"http://127.0.0.1:{LLM_PORT}").rstrip("/")
+LLM_ASK_URL = f"{LLM_BASE_URL}/ask"
+AUTO_OPEN_YOUTUBE = os.getenv("STT_AUTO_OPEN_YOUTUBE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def handle_video_recommendation(video: Optional[dict]):
+    if not video:
+        return
+
+    title = video.get("title", "추천 영상")
+    url = video.get("url")
+    start_seconds = video.get("start_seconds", 0)
+    match_source = video.get("match_source", "unknown")
+    match_score = video.get("match_score", 0)
+
+    print(f"🎬 [YouTube] {title}")
+    print(f"⏱️ [YouTube] 시작 위치: {start_seconds}초, 기준: {match_source}, 점수: {match_score}")
+    if url:
+        print(f"🔗 [YouTube] {url}")
+        if AUTO_OPEN_YOUTUBE:
+            webbrowser.open(url)
 
 def run_stt():
     recognizer = sr.Recognizer()
@@ -13,11 +37,12 @@ def run_stt():
 
     # 🛠️ 여유 있는 인식을 위한 설정 값 조정
     # 사용자가 말을 멈춘 후 '아, 말이 끝났구나'라고 판단하기 전 대기 시간 (기본값 0.8초 -> 2.0초로 연장)
-    recognizer.pause_threshold = 1.0 
+    recognizer.pause_threshold = 1.0
     # 에너지가 이 수치 이하면 침묵으로 간주 (주변 소음에 따라 자동 조절됨)
-    recognizer.dynamic_energy_threshold = 1.0 
+    recognizer.dynamic_energy_threshold = True
 
     print("👂 [STT] 음성 인식 모듈이 시작되었습니다. 마이크에 대고 말씀하세요!")
+    print(f"🔗 [STT] LLM 서버: {LLM_ASK_URL}")
     
     with microphone as source:
         print("🔍 주변 소음에 적응 중... (잠시만 기다려주세요)")
@@ -42,6 +67,7 @@ def run_stt():
                         if response.status_code == 200:
                             result = response.json()
                             print(f"🤖 [Chef]: {result.get('answer')}")
+                            handle_video_recommendation(result.get("video_recommendation"))
                         else:
                             print(f"❌ [에러] 서버 응답 오류: {response.text}")
                     except requests.exceptions.RequestException:

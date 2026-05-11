@@ -39,7 +39,7 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class YouTubeRecommendationConfig:
-    max_results: int = 5
+    max_results: int = 2
     region_code: str = "KR"
     relevance_language: str = "ko"
     transcript_languages: tuple[str, ...] = ("ko", "en")
@@ -49,7 +49,7 @@ class YouTubeRecommendationConfig:
     min_segment_score: float = 0.03
     timeout_seconds: int = 15
     allow_metadata_fallback: bool = False
-    enable_asr_fallback: bool = False
+    enable_asr_fallback: bool = True
     asr_max_videos: int = 2
     asr_model_name: str = "small"
     asr_language: str = "ko"
@@ -60,7 +60,7 @@ class YouTubeRecommendationConfig:
 
 DEFAULT_CONFIG = YouTubeRecommendationConfig(
     allow_metadata_fallback=_env_flag("YOUTUBE_METADATA_FALLBACK", False),
-    enable_asr_fallback=_env_flag("YOUTUBE_ASR_FALLBACK", False),
+    enable_asr_fallback=_env_flag("YOUTUBE_ASR_FALLBACK", True),
     asr_max_videos=_env_int("YOUTUBE_ASR_MAX_VIDEOS", 2),
     asr_model_name=os.getenv("YOUTUBE_ASR_MODEL", "small"),
     asr_language=os.getenv("YOUTUBE_ASR_LANGUAGE", "ko"),
@@ -546,45 +546,38 @@ def find_best_youtube_segment(
 
     candidates = []
     fallbacks = []
+    asr_budget = max(0, config.asr_max_videos)
+
     for video in videos:
         transcript = get_video_transcript(video["video_id"], languages=config.transcript_languages)
-        best_segments = rank_transcript_segments(query, transcript, top_k=config.top_segments, config=config)
+        match_source = "transcript"
 
+        if not transcript and config.enable_asr_fallback and asr_budget > 0:
+            transcript = transcribe_video_with_asr(video["video_id"], config=config)
+            match_source = "asr"
+            asr_budget -= 1
+
+        best_segments = rank_transcript_segments(query, transcript, top_k=config.top_segments, config=config)
         if best_segments:
-            candidates.append(_build_candidate(video, best_segments, "transcript", config))
+            candidates.append(_build_candidate(video, best_segments, match_source, config))
             continue
 
-        fallback_score = _metadata_fallback_score(video, query)
-        fallbacks.append(
-            {
-                **video,
-                "start_seconds": 0,
-                "best_segments": [],
-                "match_score": round(fallback_score, 4),
-                "match_source": "metadata",
-                "timeline_found": False,
-                "reason": "No transcript/ASR segment matched. This is a full-video fallback.",
-            }
-        )
+        if config.allow_metadata_fallback:
+            fallback_score = _metadata_fallback_score(video, query)
+            fallbacks.append(
+                {
+                    **video,
+                    "start_seconds": 0,
+                    "best_segments": [],
+                    "match_score": round(fallback_score, 4),
+                    "match_source": "metadata",
+                    "timeline_found": False,
+                    "reason": "No transcript/ASR segment matched. This is a full-video fallback.",
+                }
+            )
 
     if candidates:
         return max(candidates, key=lambda item: item["match_score"])
-
-    if config.enable_asr_fallback and fallbacks:
-        asr_candidates = []
-        fallback_order = sorted(
-            fallbacks,
-            key=lambda item: (item["match_score"], -item["rank"]),
-            reverse=True,
-        )
-        for video in fallback_order[: max(0, config.asr_max_videos)]:
-            transcript = transcribe_video_with_asr(video["video_id"], config=config)
-            best_segments = rank_transcript_segments(query, transcript, top_k=config.top_segments, config=config)
-            if best_segments:
-                asr_candidates.append(_build_candidate(video, best_segments, "asr", config))
-
-        if asr_candidates:
-            return max(asr_candidates, key=lambda item: item["match_score"])
 
     if config.allow_metadata_fallback and fallbacks:
         return max(fallbacks, key=lambda item: item["match_score"])

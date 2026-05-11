@@ -20,6 +20,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable Whisper ASR fallback when transcripts are unavailable. This is slower.",
     )
+    parser.add_argument(
+        "--allow-full-video",
+        action="store_true",
+        help="Return a title/description match from 0 seconds when no timeline segment is found.",
+    )
     return parser.parse_args()
 
 
@@ -33,6 +38,7 @@ def main() -> int:
         DEFAULT_CONFIG,
         max_results=args.max_results,
         top_segments=args.top_segments,
+        allow_metadata_fallback=args.allow_full_video,
         enable_asr_fallback=args.asr,
         asr_max_videos=1 if args.asr else 0,
     )
@@ -40,8 +46,12 @@ def main() -> int:
     print(f"cooking_video_query={is_cooking_video_query(args.query)}")
     result = find_best_youtube_segment(args.query, args.api_key, config=config)
     if result is None:
-        print("No recommendation found.")
+        print("No timeline segment found.")
+        print("Try --asr for Whisper-based timeline search, or --allow-full-video if a 0-second video link is acceptable.")
         return 1
+
+    if not result.get("timeline_found", False):
+        print("Warning: this is a full-video fallback, not a timeline match.")
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

@@ -48,7 +48,8 @@ class YouTubeRecommendationConfig:
     segment_stride: int = 3
     min_segment_score: float = 0.03
     timeout_seconds: int = 15
-    enable_asr_fallback: bool = True
+    allow_metadata_fallback: bool = False
+    enable_asr_fallback: bool = False
     asr_max_videos: int = 2
     asr_model_name: str = "small"
     asr_language: str = "ko"
@@ -58,7 +59,8 @@ class YouTubeRecommendationConfig:
 
 
 DEFAULT_CONFIG = YouTubeRecommendationConfig(
-    enable_asr_fallback=_env_flag("YOUTUBE_ASR_FALLBACK", True),
+    allow_metadata_fallback=_env_flag("YOUTUBE_METADATA_FALLBACK", False),
+    enable_asr_fallback=_env_flag("YOUTUBE_ASR_FALLBACK", False),
     asr_max_videos=_env_int("YOUTUBE_ASR_MAX_VIDEOS", 2),
     asr_model_name=os.getenv("YOUTUBE_ASR_MODEL", "small"),
     asr_language=os.getenv("YOUTUBE_ASR_LANGUAGE", "ko"),
@@ -526,6 +528,7 @@ def _build_candidate(
         "best_segments": best_segments,
         "match_score": round(top_score + rank_bonus, 4),
         "match_source": match_source,
+        "timeline_found": True,
     }
 
 
@@ -559,6 +562,8 @@ def find_best_youtube_segment(
                 "best_segments": [],
                 "match_score": round(fallback_score, 4),
                 "match_source": "metadata",
+                "timeline_found": False,
+                "reason": "No transcript/ASR segment matched. This is a full-video fallback.",
             }
         )
 
@@ -581,7 +586,7 @@ def find_best_youtube_segment(
         if asr_candidates:
             return max(asr_candidates, key=lambda item: item["match_score"])
 
-    if fallbacks:
+    if config.allow_metadata_fallback and fallbacks:
         return max(fallbacks, key=lambda item: item["match_score"])
 
     return None

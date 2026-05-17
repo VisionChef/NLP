@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+hf_cache/
+*.mp3
+*.wav
+*.log
+.vscode/
+.env
+LLM/Rag/chroma_db/
+LLM/hf_cache/
+LLM/youtube_transcript_cache/
+LLM/youtube_model_cache/
+Vision/captures/

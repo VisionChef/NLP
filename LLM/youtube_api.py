@@ -2,6 +2,7 @@ import json
 import os
 import re
 import tempfile
+from html import unescape
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -17,6 +18,7 @@ except ImportError:
     cosine_similarity = None
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_COMMENTS_URL = "https://www.googleapis.com/youtube/v3/commentThreads"
 YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v="
 YOUTUBE_EMBED_URL = "https://www.youtube.com/embed/"
 MODULE_DIR = Path(__file__).resolve().parent
@@ -63,6 +65,8 @@ class YouTubeRecommendationConfig:
     asr_language: str = "ko"
     asr_device: str = "cpu"
     asr_compute_type: str = "int8"
+    enable_comment_timeline: bool = True
+    comment_max_results: int = 50
     asr_cache_dir: str = str(MODULE_DIR / "youtube_transcript_cache")
     asr_model_cache_dir: str = str(MODULE_DIR / "youtube_model_cache")
 
@@ -75,6 +79,8 @@ DEFAULT_CONFIG = YouTubeRecommendationConfig(
     asr_language=os.getenv("YOUTUBE_ASR_LANGUAGE", "ko"),
     asr_device=os.getenv("YOUTUBE_ASR_DEVICE", "cpu"),
     asr_compute_type=os.getenv("YOUTUBE_ASR_COMPUTE_TYPE", "int8"),
+    enable_comment_timeline=_env_flag("YOUTUBE_COMMENT_TIMELINE", True),
+    comment_max_results=_env_int("YOUTUBE_COMMENT_MAX_RESULTS", 50),
     asr_cache_dir=os.getenv("YOUTUBE_ASR_CACHE_DIR", str(MODULE_DIR / "youtube_transcript_cache")),
     asr_model_cache_dir=os.getenv("YOUTUBE_ASR_MODEL_CACHE_DIR", str(MODULE_DIR / "youtube_model_cache")),
 )
@@ -108,6 +114,36 @@ def _basic_similarity(document: str, query: str) -> float:
         gram_score = len(document_grams & query_grams) / len(query_grams)
 
     return max(token_score, gram_score)
+
+
+def parse_timestamp_to_seconds(value: str) -> Optional[int]:
+    parts = [part for part in value.strip().split(":") if part != ""]
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if any(number < 0 for number in numbers):
+        return None
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        if seconds >= 60:
+            return None
+        return minutes * 60 + seconds
+    hours, minutes, seconds = numbers
+    if minutes >= 60 or seconds >= 60:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def extract_timestamps(text: str) -> list[int]:
+    timestamps: list[int] = []
+    for match in re.finditer(r"(?<!\d)(\d{1,2}:\d{2}(?::\d{2})?)(?!\d)", text):
+        seconds = parse_timestamp_to_seconds(match.group(1))
+        if seconds is not None and seconds not in timestamps:
+            timestamps.append(seconds)
+    return timestamps
 
 
 def _similarity_scores(documents: list[str], query_text: str) -> list[float]:
@@ -182,7 +218,7 @@ def build_embed_url(video_id: str, start_seconds: Optional[Union[int, float]] = 
         return f"{YOUTUBE_EMBED_URL}{video_id}"
 
     start = max(0, int(start_seconds))
-    return f"{YOUTUBE_EMBED_URL}{video_id}?start={start}&autoplay=1"
+    return f"{YOUTUBE_EMBED_URL}{video_id}?start={start}"
 
 
 def search_youtube_videos(
@@ -247,6 +283,66 @@ def search_youtube_videos(
         )
 
     return videos
+
+
+def fetch_comment_timeline_segments(
+    video: dict[str, Any],
+    query: str,
+    api_key: str,
+    config: YouTubeRecommendationConfig = DEFAULT_CONFIG,
+) -> list[dict[str, Any]]:
+    if not config.enable_comment_timeline or not api_key:
+        return []
+
+    params = {
+        "part": "snippet",
+        "videoId": video["video_id"],
+        "maxResults": max(1, min(100, config.comment_max_results)),
+        "order": "relevance",
+        "textFormat": "plainText",
+        "key": api_key,
+    }
+
+    try:
+        response = requests.get(YOUTUBE_COMMENTS_URL, params=params, timeout=config.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
+    except (RequestException, ValueError):
+        return []
+
+    candidates = []
+    query_text = normalize_text_for_tfidf(query)
+    for item in data.get("items", []):
+        snippet = (
+            item.get("snippet", {})
+            .get("topLevelComment", {})
+            .get("snippet", {})
+        )
+        raw_text = snippet.get("textOriginal") or snippet.get("textDisplay") or ""
+        text = normalize_text_for_tfidf(unescape(raw_text))
+        timestamps = extract_timestamps(raw_text)
+        if not text or not timestamps:
+            continue
+
+        document = normalize_text_for_tfidf(
+            f"{video.get('title', '')} {video.get('description', '')} {text}"
+        )
+        score = _similarity_scores([document], query_text)[0] if query_text else 0.0
+        if score < config.min_segment_score:
+            continue
+
+        for start_seconds in timestamps[:3]:
+            candidates.append(
+                {
+                    "start_seconds": start_seconds,
+                    "duration": 40,
+                    "text": raw_text[:220],
+                    "score": round(min(1.0, score + 0.04), 4),
+                }
+            )
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[: config.top_segments]
 
 
 def _snippet_to_dict(snippet: Any) -> dict[str, Any]:
@@ -581,6 +677,10 @@ def find_best_youtube_segment(
     for video in videos:
         transcript = get_video_transcript(video["video_id"], languages=config.transcript_languages)
         match_source = "transcript"
+
+        comment_segments = fetch_comment_timeline_segments(video, query, api_key, config=config)
+        if comment_segments:
+            candidates.append(_build_candidate(video, comment_segments, "comments", config))
 
         if not transcript and config.enable_asr_fallback and asr_budget > 0:
             transcript = transcribe_video_with_asr(video["video_id"], config=config)

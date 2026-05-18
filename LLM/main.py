@@ -81,17 +81,22 @@ generation_lock = threading.Lock()
 generation_state_lock = threading.Lock()
 generation_cancel_event = threading.Event()
 generation_active = False
+SERVER_TTS_ENABLED = os.getenv("ENABLE_SERVER_TTS", "0").strip().lower() in {"1", "true", "yes", "on"}
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "skt/A.X-4.0-Light")
 LLM_LOCAL_MODEL_DIR = os.getenv("LLM_LOCAL_MODEL_DIR", DEFAULT_LOCAL_MODEL_DIR)
 LLM_LOAD_IN_8BIT = os.getenv("LLM_LOAD_IN_8BIT", "0").strip().lower() in {"1", "true", "yes", "on"}
 SYSTEM_PROMPT = """너는 사용자 옆에서 같이 요리하는 만능 셰프야.
 말투는 사람과 대화하듯 자연스럽고 친근하게 해. 사용자를 가르치는 설명서가 아니라, 지금 주방에서 같이 조리하는 셰프처럼 반응해.
+항상 존댓말로 말해. 반말, 친구 말투, 명령조는 절대 쓰지 말고 "~요", "~세요", "~습니다" 형태로 답해.
 재료 손질, 조리 순서, 대체 재료, 간 맞추기, 실패 수습, 보관법, 플레이팅까지 폭넓게 도와줘.
 사용자의 말이 짧거나 애매하면 먼저 상황을 짚고, 필요한 질문은 한 가지만 물어봐.
+레시피 추천은 먼저 참고 문서의 RAG 결과를 우선해. RAG 결과가 없으면 네 일반 요리 지식으로 답해도 된다.
+단, 어떤 경우에도 현재 인식된 재료나 사용자가 말한 보유 재료로 만들 수 있는 음식만 추천해. 사용자가 가지고 있지 않은 재료가 꼭 필요한 레시피는 추천하지 마.
+현재 사용 가능한 재료 목록에 없는 식재료, 양념, 토핑, 고명은 새로 꺼내지 마. 기본재료도 목록에 포함되어 있을 때만 사용할 수 있어.
 요리 실행을 안내할 때는 반드시 아래 방식을 지켜.
 지금 사용자가 바로 실행할 한 단계만 말해. 전체 레시피, 전체 순서, 다음 단계 목록을 한 번에 말하지 마.
-한 단계 안에서는 아주 구체적으로 말해. 양, 불 세기, 시간, 손의 움직임, 냄새와 색 변화, 익은 상태 기준, 흔한 실수와 주의점을 포함해.
-답변은 3문장 이상 6문장 이하로 자연스럽게 말해. 너무 짧게 끝내지 말고, 사용자가 바로 따라 할 수 있을 만큼 디테일하게 말해.
+한 단계 안에서는 꼭 필요한 양, 불 세기, 시간, 상태 기준만 짚어.
+답변은 2문장 이상 4문장 이하로 짧게 말해. 요리 중 듣기 부담스럽지 않게 핵심만 말해.
 사용자가 "다 했어", "다음", "계속", "했어"처럼 진행 신호를 주면 그때 다음 단계로 넘어가.
 사용자가 전체 레시피를 물어도 전체를 나열하지 말고, 먼저 시작 단계부터 같이 진행해.
 절대 *, #, - 같은 기호나 번호 목록을 쓰지 말고 구어체로만 답해.
@@ -138,7 +143,7 @@ def generate_llm_answer(prompt: str) -> str:
     try:
         outputs = pipe(
             prompt,
-            max_new_tokens=360,
+            max_new_tokens=240,
             do_sample=True,
             temperature=0.62,
             repetition_penalty=1.08,
@@ -299,6 +304,7 @@ current_ingredients = []
 pending_ingredients = []
 cached_rag_context = "없음"
 chat_history = [] 
+cached_rag_matches = []
 
 
 @app.get("/health")
@@ -348,6 +354,11 @@ def play_tts(text: str):
         if os.path.exists(filename):
             os.remove(filename)
 
+
+def queue_tts(background_tasks: BackgroundTasks, text: str) -> None:
+    if SERVER_TTS_ENABLED:
+        background_tasks.add_task(play_tts, text)
+
 # ==========================================
 # 🌐 API 엔드포인트
 # ==========================================
@@ -358,6 +369,7 @@ class VisionData(BaseModel):
 
 class STTData(BaseModel):
     user_text: str
+    ingredients: list[str] = Field(default_factory=list)
 
 
 def _clean_ingredients(ingredients: list[str]) -> list[str]:
@@ -401,13 +413,15 @@ def _search_recipes_fallback(user_ingredients: list[str], top_k: int = 2) -> lis
         if not recipe_ingredients:
             continue
 
-        overlap = recipe_ingredients & normalized_user
-        if not overlap:
+        missing = recipe_ingredients - normalized_user
+        if missing:
             continue
 
-        missing = recipe_ingredients - normalized_user
-        coverage = len(overlap) / len(recipe_ingredients)
-        ranked.append((len(missing), -coverage, doc))
+        coverage = len(recipe_ingredients & normalized_user) / len(recipe_ingredients)
+        if coverage < 0.9:
+            continue
+
+        ranked.append((-len(recipe_ingredients), -coverage, doc))
 
     ranked.sort(key=lambda item: (item[0], item[1], item[2].metadata.get("title", "")))
     recipes = []
@@ -417,8 +431,40 @@ def _search_recipes_fallback(user_ingredients: list[str], top_k: int = 2) -> lis
             "ingredients": doc.metadata["ingredients"],
             "steps": doc.metadata["steps"],
             "source_type": doc.metadata["source_type"],
-            "similarity": 0,
+            "similarity": 1.0,
         })
+    return recipes
+
+
+def _search_available_recipes(user_ingredients: list[str], top_k: int = 2) -> list[dict]:
+    if not user_ingredients or (not vectorstore and not recipe_documents):
+        return []
+    if vectorstore:
+        return search_recipes(vectorstore, user_ingredients, top_k=top_k, min_score=0.9)
+    return _search_recipes_fallback(user_ingredients, top_k=top_k)
+
+
+def _refresh_cached_rag_for_ingredients(ingredients: list[str]) -> list[dict]:
+    global current_ingredients, cached_rag_context, cached_rag_matches
+
+    current_ingredients = _clean_ingredients(ingredients)
+    recipes = _search_available_recipes(current_ingredients, top_k=2)
+    if recipes:
+        cached_rag_context = _cache_recipe_context(recipes)
+        cached_rag_matches = [
+            {
+                "title": recipe["title"],
+                "similarity": recipe.get("similarity", 0),
+                "source_type": recipe.get("source_type", ""),
+            }
+            for recipe in recipes
+        ]
+    else:
+        cached_rag_context = (
+            "RAG 검색 결과 없음. 모델의 일반 요리 지식으로 답하되, "
+            "현재 인식된 재료 안에서 만들 수 있는 음식만 제안할 것."
+        )
+        cached_rag_matches = []
     return recipes
 
 
@@ -460,48 +506,61 @@ def _handle_confirmed_ingredients(
     ingredients: list[str],
     background_tasks: BackgroundTasks,
 ) -> dict:
-    global current_ingredients, cached_rag_context, chat_history
+    global current_ingredients, cached_rag_context, cached_rag_matches, chat_history
 
     current_ingredients = _clean_ingredients(ingredients)
     print(f"👁️ [Vision]: {current_ingredients}")
 
     if not current_ingredients:
         cached_rag_context = "없음"
+        cached_rag_matches = []
         return {
             "status": "success",
             "recipes_found": 0,
             "rag_loaded": vectorstore is not None or bool(recipe_documents),
             "rag_mode": rag_mode,
+            "rag_matches": cached_rag_matches,
             "message": "인식된 재료가 없습니다.",
         }
 
     if not vectorstore and not recipe_documents:
         cached_rag_context = "없음"
+        cached_rag_matches = []
         return {
             "status": "success",
             "recipes_found": 0,
             "rag_loaded": False,
+            "rag_matches": cached_rag_matches,
             "message": "RAG가 아직 준비되지 않았습니다.",
         }
 
     print(f"🔍 RAG 검색 (재료 기반): {current_ingredients}")
-    if vectorstore:
-        recipes = search_recipes(vectorstore, current_ingredients, top_k=2)
-    else:
-        recipes = _search_recipes_fallback(current_ingredients, top_k=2)
+    recipes = _search_available_recipes(current_ingredients, top_k=2)
 
     if recipes:
         cached_rag_context = _cache_recipe_context(recipes)
+        cached_rag_matches = [
+            {
+                "title": recipe["title"],
+                "similarity": recipe.get("similarity", 0),
+                "source_type": recipe.get("source_type", ""),
+            }
+            for recipe in recipes
+        ]
         print(f"  -> {len(recipes)}개 레시피를 컨텍스트로 캐싱함")
 
         first_recipe_title = recipes[0]["title"]
         opening_line = f"냉장고에 있는 재료로 만들 수 있는 {first_recipe_title} 어떠세요? 레시피가 궁금하시면 알려주세요."
     else:
-        cached_rag_context = "추천할 레시피가 없습니다."
-        opening_line = "가지고 계신 재료로는 추천해드릴만한 요리가 없네요. 다른 재료가 있나요?"
+        cached_rag_context = (
+            "RAG 검색 결과 없음. 모델의 일반 요리 지식으로 답하되, "
+            "현재 인식된 재료 안에서 만들 수 있는 음식만 제안할 것."
+        )
+        cached_rag_matches = []
+        opening_line = "딱 맞는 RAG 레시피는 없어요. 그래도 가진 재료 안에서 만들 수 있는 쪽으로 같이 찾아볼게요."
 
     print(f"🗣️ [A.X Chef]: {opening_line}")
-    background_tasks.add_task(play_tts, opening_line)
+    queue_tts(background_tasks, opening_line)
     chat_history.append({"role": "assistant", "content": opening_line})
 
     return {
@@ -509,12 +568,13 @@ def _handle_confirmed_ingredients(
         "recipes_found": len(recipes),
         "rag_loaded": True,
         "rag_mode": rag_mode,
+        "rag_matches": cached_rag_matches,
         "message": opening_line,
     }
 
 @app.post("/vision")
 async def update_vision(data: VisionData, background_tasks: BackgroundTasks):
-    global current_ingredients, pending_ingredients, cached_rag_context
+    global current_ingredients, pending_ingredients, cached_rag_context, cached_rag_matches
 
     action = (data.action or "update").strip().lower()
     ingredients = _clean_ingredients(data.ingredients)
@@ -527,7 +587,7 @@ async def update_vision(data: VisionData, background_tasks: BackgroundTasks):
         ingredient_text = ", ".join(pending_ingredients)
         confirmation_line = f"{ingredient_text} 재료가 맞나요? 맞으면 엄지척, 아니면 주먹을 보여주세요."
         print(f"🗣️ [A.X Chef]: {confirmation_line}")
-        background_tasks.add_task(play_tts, confirmation_line)
+        queue_tts(background_tasks, confirmation_line)
         return {
             "status": "waiting_confirmation",
             "ingredients": pending_ingredients,
@@ -543,9 +603,10 @@ async def update_vision(data: VisionData, background_tasks: BackgroundTasks):
         current_ingredients = []
         pending_ingredients = []
         cached_rag_context = "없음"
+        cached_rag_matches = []
         rejection_line = "알겠습니다. 재료를 다시 인식해볼게요."
         print(f"🗣️ [A.X Chef]: {rejection_line}")
-        background_tasks.add_task(play_tts, rejection_line)
+        queue_tts(background_tasks, rejection_line)
         return {"status": "rejected", "message": rejection_line}
 
     pending_ingredients = []
@@ -624,11 +685,32 @@ async def cancel_generation():
     }
 
 
+def shutdown_llm_process() -> None:
+    time.sleep(0.5)
+    os._exit(0)
+
+
+@app.post("/shutdown")
+async def shutdown_llm():
+    generation_cancel_event.set()
+    try:
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+    except Exception as exc:
+        print(f"⚠️ [Shutdown] TTS 중단 실패: {exc}")
+    threading.Thread(target=shutdown_llm_process, daemon=True).start()
+    return {"status": "shutting_down"}
+
+
 @app.post("/ask")
 async def ask_chef(data: STTData, background_tasks: BackgroundTasks):
     global chat_history, cached_rag_context
     if pipe is None:
         raise HTTPException(status_code=503, detail="LLM model is not loaded yet.")
+
+    payload_ingredients = _clean_ingredients(data.ingredients)
+    if payload_ingredients and set(payload_ingredients) != set(current_ingredients):
+        _refresh_cached_rag_for_ingredients(payload_ingredients)
 
     youtube_api_key = get_runtime_env("YOUTUBE_API_KEY")
     wants_youtube, youtube_intent_source = _llm_wants_youtube_video(data.user_text)
@@ -636,7 +718,8 @@ async def ask_chef(data: STTData, background_tasks: BackgroundTasks):
     # 💡 저장된 RAG 검색 결과를 가져와 사용합니다.
     rag_context = cached_rag_context
 
-    ing_str = ", ".join(current_ingredients) if current_ingredients else "없음"
+    effective_ingredients = payload_ingredients or current_ingredients
+    ing_str = ", ".join(effective_ingredients) if effective_ingredients else "없음"
     
     # 프롬프트 구성
     prompt_template = SYSTEM_PROMPT.format(rag_context=rag_context)
@@ -649,7 +732,12 @@ async def ask_chef(data: STTData, background_tasks: BackgroundTasks):
             "사람 셰프처럼 자연스럽게 지금 필요한 조리 포인트 한 단계만 설명하고 '아래 영상도 같이 확인해보세요'라고 말하세요."
         )
 
-    prompt = f"<|im_start|>system\n{prompt_template}\n현재 인식된 재료: {ing_str}{youtube_instruction}<|im_end|>\n"
+    prompt = (
+        f"<|im_start|>system\n{prompt_template}\n"
+        f"현재 사용 가능한 재료: {ing_str}\n"
+        "위 재료 목록에 없는 식재료는 추천하거나 조리 단계에 넣지 마세요."
+        f"{youtube_instruction}<|im_end|>\n"
+    )
     
     # 이전 대화 추가
     for hist in chat_history[-4:]:
@@ -691,7 +779,7 @@ async def ask_chef(data: STTData, background_tasks: BackgroundTasks):
     chat_history.append({"role": "assistant", "content": llm_answer})
 
     print(f"🔥 [A.X Chef]: {llm_answer}")
-    background_tasks.add_task(play_tts, llm_answer)
+    queue_tts(background_tasks, llm_answer)
 
     youtube_status = {
         "requested": wants_youtube,
@@ -726,6 +814,7 @@ async def ask_chef(data: STTData, background_tasks: BackgroundTasks):
 
     return {
         "answer": llm_answer,
+        "rag_matches": cached_rag_matches,
         "video_recommendation": video_recommendation,
         "youtube_status": youtube_status,
     }

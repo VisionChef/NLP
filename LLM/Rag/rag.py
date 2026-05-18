@@ -30,7 +30,7 @@ BOOK_RECIPES_FILE     = "recipes.json"
 TRENDING_RECIPES_FILE = "trending_recipes.json"
 CHROMA_DIR            = "chroma_db"
 
-MIN_SIMILARITY_SCORE = 0.85
+MIN_SIMILARITY_SCORE = 0.9
 
 
 # ─────────────────────────────────────
